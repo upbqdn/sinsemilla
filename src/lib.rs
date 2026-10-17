@@ -2,11 +2,9 @@
 
 #![no_std]
 
-// We require `alloc` for now.
+// Domain constructors require `alloc` for their personalization strings.
 #[macro_use]
 extern crate alloc;
-
-use alloc::vec::Vec;
 
 use group::{Curve, Wnaf};
 use pasta_curves::{
@@ -19,6 +17,19 @@ mod addition;
 use self::addition::IncompletePoint;
 mod sinsemilla_s;
 pub use sinsemilla_s::SINSEMILLA_S;
+
+// These protocol constants are validated against hash-to-curve in the tests.
+static SINSEMILLA_S_AFFINE: [pallas::Affine; 1 << K] = {
+    let mut points =
+        [pallas::Affine::from_xy_unchecked(pallas::Base::zero(), pallas::Base::zero()); 1 << K];
+    let mut i = 0;
+    while i < points.len() {
+        let (x, y) = SINSEMILLA_S[i];
+        points[i] = pallas::Affine::from_xy_unchecked(x, y);
+        i += 1;
+    }
+    points
+};
 
 /// Number of bits of each message piece in $\mathsf{SinsemillaHashToPoint}$
 pub const K: usize = 10;
@@ -64,63 +75,47 @@ fn extract_p_bottom(point: CtOption<pallas::Point>) -> CtOption<pallas::Base> {
     })
 }
 
-/// Pads the given iterator (which MUST have length $\leq K * C$) with zero-bits to a
-/// multiple of $K$ bits.
-struct Pad<I: Iterator<Item = bool>> {
-    /// The iterator we are padding.
+/// Converts a bit iterator into zero-padded [`K`]-bit words.
+struct MessageWords<I: Iterator<Item = bool>> {
     inner: I,
-    /// The measured length of the inner iterator.
-    ///
-    /// This starts as a lower bound, and will be accurate once `padding_left.is_some()`.
-    len: usize,
-    /// The amount of padding that remains to be emitted.
-    padding_left: Option<usize>,
+    bits_read: usize,
+    finished: bool,
 }
 
-impl<I: Iterator<Item = bool>> Pad<I> {
+impl<I: Iterator<Item = bool>> MessageWords<I> {
     fn new(inner: I) -> Self {
-        Pad {
+        Self {
             inner,
-            len: 0,
-            padding_left: None,
+            bits_read: 0,
+            finished: false,
         }
     }
 }
 
-impl<I: Iterator<Item = bool>> Iterator for Pad<I> {
-    type Item = bool;
+impl<I: Iterator<Item = bool>> Iterator for MessageWords<I> {
+    type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // If we have identified the required padding, the inner iterator has ended,
-            // and we will never poll it again.
-            if let Some(n) = self.padding_left.as_mut() {
-                if *n == 0 {
-                    // Either we already emitted all necessary padding, or there was no
-                    // padding required.
-                    break None;
-                } else {
-                    // Emit the next padding bit.
-                    *n -= 1;
-                    break Some(false);
+        if self.finished {
+            return None;
+        }
+
+        let mut word = 0;
+        for bit_index in 0..K {
+            match self.inner.next() {
+                Some(bit) => {
+                    self.bits_read += 1;
+                    assert!(self.bits_read <= K * C);
+                    word |= u32::from(bit) << bit_index;
                 }
-            } else if let Some(ret) = self.inner.next() {
-                // We haven't reached the end of the inner iterator yet.
-                self.len += 1;
-                assert!(self.len <= K * C);
-                break Some(ret);
-            } else {
-                // Inner iterator just ended, so we now know its length.
-                let rem = self.len % K;
-                if rem > 0 {
-                    // The inner iterator requires padding in the range [1,K).
-                    self.padding_left = Some(K - rem);
-                } else {
-                    // No padding required.
-                    self.padding_left = Some(0);
+                None => {
+                    self.finished = true;
+                    return (bit_index > 0).then_some(word);
                 }
             }
         }
+
+        Some(word)
     }
 }
 
@@ -147,18 +142,11 @@ impl HashDomain {
         self.hash_to_point_inner(msg).into()
     }
 
-    #[allow(non_snake_case)]
     fn hash_to_point_inner(&self, msg: impl Iterator<Item = bool>) -> IncompletePoint {
-        let padded: Vec<_> = Pad::new(msg).collect();
-
-        padded
-            .chunks(K)
-            .fold(IncompletePoint::from(self.Q), |acc, chunk| {
-                let (S_x, S_y) =
-                    SINSEMILLA_S[lebs2ip_k(chunk.try_into().expect("correct length")) as usize];
-                let S_chunk = pallas::Affine::from_xy(S_x, S_y).unwrap();
-                (acc + S_chunk) + acc
-            })
+        MessageWords::new(msg).fold(IncompletePoint::from(self.Q), |acc, word| {
+            // A K-bit word is at most 1023, so it fits into usize on every target.
+            acc.double_and_add(SINSEMILLA_S_AFFINE[word as usize])
+        })
     }
 
     /// $\mathsf{SinsemillaHash}$ from [§ 5.4.1.9][concretesinsemillahash].
@@ -264,69 +252,17 @@ impl CommitDomain {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloc::vec::Vec;
+mod hash_to_point_tests;
 
+#[cfg(test)]
+mod tests {
+    use super::K;
     use super::sinsemilla_s::SINSEMILLA_S;
-    use super::{K, Pad};
     use group::Curve;
     use pasta_curves::{
         arithmetic::{CurveAffine, CurveExt},
         pallas,
     };
-
-    #[test]
-    fn pad() {
-        assert_eq!(
-            Pad::new([].iter().cloned()).collect::<Vec<_>>(),
-            vec![false; 0]
-        );
-        assert_eq!(
-            Pad::new([true].iter().cloned()).collect::<Vec<_>>(),
-            vec![
-                true, false, false, false, false, false, false, false, false, false
-            ]
-        );
-        assert_eq!(
-            Pad::new([true, true].iter().cloned()).collect::<Vec<_>>(),
-            vec![
-                true, true, false, false, false, false, false, false, false, false
-            ]
-        );
-        assert_eq!(
-            Pad::new([true, true, true].iter().cloned()).collect::<Vec<_>>(),
-            vec![
-                true, true, true, false, false, false, false, false, false, false
-            ]
-        );
-        assert_eq!(
-            Pad::new(
-                [
-                    true, true, false, true, false, true, false, true, false, true
-                ]
-                .iter()
-                .cloned()
-            )
-            .collect::<Vec<_>>(),
-            vec![
-                true, true, false, true, false, true, false, true, false, true
-            ]
-        );
-        assert_eq!(
-            Pad::new(
-                [
-                    true, true, false, true, false, true, false, true, false, true, true
-                ]
-                .iter()
-                .cloned()
-            )
-            .collect::<Vec<_>>(),
-            vec![
-                true, true, false, true, false, true, false, true, false, true, true, false, false,
-                false, false, false, false, false, false, false
-            ]
-        );
-    }
 
     #[test]
     fn sinsemilla_s() {

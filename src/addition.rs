@@ -1,7 +1,13 @@
+#[cfg(test)]
 use core::ops::Add;
 
-use group::{CurveAffine as _, Group};
-use pasta_curves::pallas;
+#[cfg(test)]
+use group::CurveAffine as _;
+use group::Group;
+use pasta_curves::{
+    arithmetic::{CurveAffine as _, CurveExt as _},
+    pallas,
+};
 use subtle::{ConstantTimeEq, CtOption};
 
 /// P ∪ {⊥}
@@ -22,6 +28,39 @@ impl From<IncompletePoint> for CtOption<pallas::Point> {
     }
 }
 
+impl IncompletePoint {
+    /// Computes `(self ⸭ rhs) ⸭ self` with the same incomplete-addition
+    /// failure conditions as the two separate additions.
+    ///
+    /// Writing `P = self` and `S = rhs`, the first addition of nonidentity
+    /// points fails exactly when `x(P) = x(S)`, which on Pallas means
+    /// `P = ±S`. With `T = P + S`, `T = O` iff `P = -S` and `T = P` iff
+    /// `S = O`, both already excluded. The remaining failure `T = -P` is
+    /// equivalent to `2P + S = O`.
+    pub(super) fn double_and_add(self, rhs: pallas::Affine) -> Self {
+        IncompletePoint(self.0.and_then(|p| {
+            let (p_x, _, p_z) = p.jacobian_coordinates();
+            let rhs_coordinates = rhs.coordinates();
+            let rhs_is_identity = !rhs_coordinates.is_some();
+            let rhs_x = rhs_coordinates
+                .map(|coordinates| *coordinates.x())
+                .unwrap_or(pallas::Base::zero());
+
+            // The affine x-coordinate of p is p_x / p_z². Cross-multiply
+            // instead of normalizing p, which would require an inversion.
+            let same_x = p_x.ct_eq(&(rhs_x * p_z.square()));
+            let result = p.double() + rhs;
+
+            CtOption::new(
+                result,
+                !(p.is_identity() | rhs_is_identity | same_x | result.is_identity()),
+            )
+        }))
+    }
+}
+
+// Retain the original operations only as the equivalence-test oracle.
+#[cfg(test)]
 impl Add for IncompletePoint {
     type Output = IncompletePoint;
 
@@ -46,6 +85,7 @@ impl Add for IncompletePoint {
     }
 }
 
+#[cfg(test)]
 impl Add<pallas::Affine> for IncompletePoint {
     type Output = IncompletePoint;
 
@@ -71,3 +111,6 @@ impl Add<pallas::Affine> for IncompletePoint {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;
