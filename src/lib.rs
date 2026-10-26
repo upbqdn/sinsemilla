@@ -2,7 +2,7 @@
 
 #![no_std]
 
-// Domain constructors require `alloc` for their personalization strings.
+// Domain constructors and weighted tables require `alloc`.
 #[macro_use]
 extern crate alloc;
 
@@ -17,6 +17,7 @@ mod addition;
 use self::addition::IncompletePoint;
 mod sinsemilla_s;
 pub use sinsemilla_s::SINSEMILLA_S;
+pub mod weighted;
 
 // These protocol constants are validated against hash-to-curve in the tests.
 static SINSEMILLA_S_AFFINE: [pallas::Affine; 1 << K] = {

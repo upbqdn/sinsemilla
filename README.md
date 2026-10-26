@@ -22,6 +22,22 @@ the selected bases using a double-and-add algorithm. This ends up being provably
 as secure as a vector Pedersen hash, and makes advantageous use of the lookup
 facility supported by Halo 2.
 
+## Fixed-length evaluation
+
+The additive `weighted::UncheckedFixedLengthHashDomain<N>` API precomputes
+position-weighted generators for messages of exactly `N` ten-bit words.
+Construct it once from a `HashDomain`, then use `hash_words` or
+`hash_words_to_point` with pre-decoded words, or `hash` and `hash_to_point`
+with bit iterators. Construction and evaluation require `alloc`, not `std`.
+The 52-word Orchard domain retains 3.75 MiB of tables; construction is
+intentionally expensive and should stay outside repeated hashing paths.
+
+This evaluator omits incomplete-addition exceptional-case checks. It agrees
+with `HashDomain` except on inputs hitting those cases, which would reveal a
+nontrivial discrete-logarithm relation among the independently generated
+Sinsemilla bases. See the `weighted` module's security argument. Use
+`HashDomain` when exact partial-function semantics are required.
+
 ## License
 
 Licensed under either of
