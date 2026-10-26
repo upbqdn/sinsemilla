@@ -6,6 +6,10 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Hash messages as a stream of words without allocating padded bits, use
+  precomputed affine generators, and fuse each pair of incomplete additions.
+  Hash outputs and exceptional-case handling are unchanged.
 
 ## [0.2.0] - 2026-09-25
 ### Added
