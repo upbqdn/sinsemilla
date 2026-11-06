@@ -1,10 +1,10 @@
 use alloc::vec::Vec;
 
-use group::{ff::Field, Curve, CurveAffine as _, Group};
+use group::{Curve, CurveAffine as _, Group, ff::Field};
 use pasta_curves::pallas;
 use subtle::CtOption;
 
-use super::{UncheckedFixedLengthHashDomain, GENERATOR_COUNT};
+use super::{GENERATOR_COUNT, UncheckedFixedLengthHashDomain};
 use crate::{HashDomain, K, SINSEMILLA_S_AFFINE};
 
 const MERKLE_WORDS: usize = 52;

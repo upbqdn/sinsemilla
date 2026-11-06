@@ -62,13 +62,13 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::mem;
 
-use group::{ff::Field, Curve, CurveAffine as _, Group};
+use group::{Curve, CurveAffine as _, Group, ff::Field};
 use pasta_curves::{
     arithmetic::{Coordinates, CurveAffine as _},
     pallas,
 };
 
-use super::{HashDomain, MessageWords, C, K, SINSEMILLA_S_AFFINE};
+use super::{C, HashDomain, K, MessageWords, SINSEMILLA_S_AFFINE};
 
 const GENERATOR_COUNT: usize = 1 << K;
 
@@ -199,9 +199,11 @@ impl<const N: usize> UncheckedFixedLengthHashDomain<N> {
         let mut affine_row: Vec<_> = SINSEMILLA_S_AFFINE.to_vec();
 
         for exponent in 0..N {
-            assert!(affine_row
-                .iter()
-                .all(|point| !bool::from(point.is_identity())));
+            assert!(
+                affine_row
+                    .iter()
+                    .all(|point| !bool::from(point.is_identity()))
+            );
             weighted_generators.extend(affine_row.iter().copied());
 
             if exponent + 1 < N {
@@ -224,9 +226,11 @@ impl<const N: usize> UncheckedFixedLengthHashDomain<N> {
             &first_accumulator_points,
             &mut weighted_generators[first_row_start..],
         );
-        assert!(weighted_generators[first_row_start..]
-            .iter()
-            .all(|point| !bool::from(point.is_identity())));
+        assert!(
+            weighted_generators[first_row_start..]
+                .iter()
+                .all(|point| !bool::from(point.is_identity()))
+        );
 
         let mut fused_first_two = Vec::new();
         if N > 1 {
