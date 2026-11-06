@@ -11,8 +11,10 @@ fn padded_words(bits: &[bool]) -> Vec<u32> {
     let mut padded = bits.to_vec();
     padded.resize(bits.len().div_ceil(K) * K, false);
     padded
-        .chunks_exact(K)
-        .map(|chunk| super::lebs2ip_k(chunk.try_into().unwrap()))
+        .as_chunks::<K>()
+        .0
+        .iter()
+        .map(|chunk| super::lebs2ip_k(*chunk))
         .collect()
 }
 
