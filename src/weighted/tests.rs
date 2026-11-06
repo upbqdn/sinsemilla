@@ -1,10 +1,10 @@
 use alloc::vec::Vec;
 
-use group::{Curve, CurveAffine as _, Group};
+use group::{ff::Field, Curve, CurveAffine as _, Group};
 use pasta_curves::pallas;
 use subtle::CtOption;
 
-use super::{GENERATOR_COUNT, UncheckedFixedLengthHashDomain};
+use super::{UncheckedFixedLengthHashDomain, GENERATOR_COUNT};
 use crate::{HashDomain, K, SINSEMILLA_S_AFFINE};
 
 const MERKLE_WORDS: usize = 52;
@@ -50,6 +50,9 @@ fn unchecked_evaluator_deliberately_skips_incomplete_addition_failure() {
         unchecked.hash_words_to_point(&words),
         generator_point.double() + generator
     );
+    let mut out = [pallas::Base::zero()];
+    unchecked.hash_words_batch(&[words], &mut out, &mut super::BatchHashScratch::default());
+    assert_eq!(out[0], unchecked.hash_words(&words));
 }
 
 #[test]
@@ -208,4 +211,71 @@ fn rejects_invalid_fused_second_word() {
 fn rejects_invalid_later_word() {
     let weighted = UncheckedFixedLengthHashDomain::<3>::new(&HashDomain::new(MERKLE_DOMAIN));
     weighted.hash_words(&[0, 0, 1024]);
+}
+
+#[test]
+fn batch_affine_matches_scalar_and_reuses_scratch() {
+    let weighted =
+        UncheckedFixedLengthHashDomain::<MERKLE_WORDS>::new(&HashDomain::new(MERKLE_DOMAIN));
+    let mut scratch = super::BatchHashScratch::default();
+    let mut state = 0x4261_7463_6841_6666;
+    for count in [0, 1, 2, 3, 16, 31, 64, 257, 17, 1] {
+        let words: Vec<[u16; MERKLE_WORDS]> = (0..count)
+            .map(|lane| {
+                core::array::from_fn(|position| match lane {
+                    0 => 0,
+                    1 => 1023,
+                    2 => u16::try_from(position).unwrap(),
+                    _ => u16::try_from(splitmix64(&mut state) & 0x3ff).unwrap(),
+                })
+            })
+            .collect();
+        let mut out = vec![pallas::Base::zero(); count];
+        weighted.hash_words_batch(&words, &mut out, &mut scratch);
+        for (words, actual) in words.iter().zip(out) {
+            assert_eq!(actual, weighted.hash_words(words));
+        }
+    }
+}
+
+#[test]
+fn batch_affine_exceptional_columns_match_complete_group_addition() {
+    let s = pallas::Point::from(SINSEMILLA_S_AFFINE[0]);
+    // Include the weighted theorem's A = +/-S and 2A = -S relations, as
+    // well as identity, doubling, cancellation, and a subsequent recovery.
+    let half = (pallas::Scalar::one() + pallas::Scalar::one())
+        .invert()
+        .unwrap();
+    let points = [
+        pallas::Point::identity(),
+        s,
+        -s,
+        s.double(),
+        -s.double(),
+        -s * half,
+    ];
+    let mut scratch = super::BatchHashScratch {
+        points: points.iter().map(Curve::to_affine).collect(),
+        generators: vec![s.to_affine(); points.len()],
+        denominators: vec![pallas::Base::zero(); points.len()],
+        prefixes: vec![pallas::Base::zero(); points.len()],
+    };
+    for repetition in 1..=2 {
+        scratch.add_column();
+        for (point, actual) in points.iter().zip(&scratch.points) {
+            let expected = *point + s * pallas::Scalar::from(repetition);
+            assert_eq!(*actual, expected.to_affine());
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "invalid Sinsemilla word")]
+fn batch_affine_rejects_invalid_words() {
+    let weighted = UncheckedFixedLengthHashDomain::<2>::new(&HashDomain::new(MERKLE_DOMAIN));
+    weighted.hash_words_batch(
+        &[[0, 1024]],
+        &mut [pallas::Base::zero()],
+        &mut super::BatchHashScratch::default(),
+    );
 }

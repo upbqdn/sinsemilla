@@ -6,6 +6,11 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `weighted::UncheckedFixedLengthHashDomain::hash_words_batch` and reusable
+  `weighted::BatchHashScratch` for variable-time affine evaluation of independent
+  public messages, with the scalar weighted evaluator's complete-group semantics.
+
 ### Changed
 - Hash messages as a stream of words without allocating padded bits, use
   precomputed affine generators, and fuse each pair of incomplete additions.

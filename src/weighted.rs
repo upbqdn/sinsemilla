@@ -62,10 +62,13 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::mem;
 
-use group::{Curve, CurveAffine as _, Group};
-use pasta_curves::{arithmetic::CurveAffine as _, pallas};
+use group::{ff::Field, Curve, CurveAffine as _, Group};
+use pasta_curves::{
+    arithmetic::{Coordinates, CurveAffine as _},
+    pallas,
+};
 
-use super::{C, HashDomain, K, MessageWords, SINSEMILLA_S_AFFINE};
+use super::{HashDomain, MessageWords, C, K, SINSEMILLA_S_AFFINE};
 
 const GENERATOR_COUNT: usize = 1 << K;
 
@@ -80,6 +83,68 @@ fn extract(point: pallas::Point) -> pallas::Base {
         .coordinates()
         .map(|coordinates| *coordinates.x())
         .unwrap_or_else(pallas::Base::zero)
+}
+
+/// Reusable storage for public-input, batch-affine weighted hashing.
+#[derive(Default)]
+pub struct BatchHashScratch {
+    points: Vec<pallas::Affine>,
+    generators: Vec<pallas::Affine>,
+    denominators: Vec<pallas::Base>,
+    prefixes: Vec<pallas::Base>,
+}
+
+impl BatchHashScratch {
+    fn add_column(&mut self) {
+        let mut product = pallas::Base::one();
+        for (i, (point, generator)) in self.points.iter().zip(&self.generators).enumerate() {
+            let denominator = match (
+                Option::<Coordinates<pallas::Affine>>::from(point.coordinates()),
+                Option::<Coordinates<pallas::Affine>>::from(generator.coordinates()),
+            ) {
+                (Some(p), Some(g)) => {
+                    let difference = *g.x() - p.x();
+                    if difference == pallas::Base::zero() {
+                        pallas::Base::one()
+                    } else {
+                        difference
+                    }
+                }
+                _ => pallas::Base::one(),
+            };
+            self.prefixes[i] = product;
+            self.denominators[i] = denominator;
+            product *= denominator;
+        }
+        let mut inverse = product.invert().unwrap();
+        for i in (0..self.points.len()).rev() {
+            let denominator = self.denominators[i];
+            self.denominators[i] = inverse * self.prefixes[i];
+            inverse *= denominator;
+        }
+        for ((point, generator), inverse) in self
+            .points
+            .iter_mut()
+            .zip(&self.generators)
+            .zip(&self.denominators)
+        {
+            *point = match (
+                Option::<Coordinates<pallas::Affine>>::from(point.coordinates()),
+                Option::<Coordinates<pallas::Affine>>::from(generator.coordinates()),
+            ) {
+                (Some(p), Some(g)) if p.x() != g.x() => {
+                    let slope = (*g.y() - p.y()) * inverse;
+                    let x = slope.square() - p.x() - g.x();
+                    let y = slope * (*p.x() - x) - p.y();
+                    // The chord formula on distinct x-coordinates yields a curve point.
+                    pallas::Affine::from_xy_unchecked(x, y)
+                }
+                // Preserve the scalar evaluator's complete-group semantics, including
+                // doubling, cancellation, and identity followed by another addition.
+                _ => (pallas::Point::from(*point) + generator).to_affine(),
+            };
+        }
+    }
 }
 
 /// An unchecked fixed-word-count Sinsemilla domain with position-weighted
@@ -134,11 +199,9 @@ impl<const N: usize> UncheckedFixedLengthHashDomain<N> {
         let mut affine_row: Vec<_> = SINSEMILLA_S_AFFINE.to_vec();
 
         for exponent in 0..N {
-            assert!(
-                affine_row
-                    .iter()
-                    .all(|point| !bool::from(point.is_identity()))
-            );
+            assert!(affine_row
+                .iter()
+                .all(|point| !bool::from(point.is_identity())));
             weighted_generators.extend(affine_row.iter().copied());
 
             if exponent + 1 < N {
@@ -161,11 +224,9 @@ impl<const N: usize> UncheckedFixedLengthHashDomain<N> {
             &first_accumulator_points,
             &mut weighted_generators[first_row_start..],
         );
-        assert!(
-            weighted_generators[first_row_start..]
-                .iter()
-                .all(|point| !bool::from(point.is_identity()))
-        );
+        assert!(weighted_generators[first_row_start..]
+            .iter()
+            .all(|point| !bool::from(point.is_identity())));
 
         let mut fused_first_two = Vec::new();
         if N > 1 {
@@ -209,6 +270,60 @@ impl<const N: usize> UncheckedFixedLengthHashDomain<N> {
     /// Panics if any word is not a valid [`K`]-bit Sinsemilla word.
     pub fn hash_words(&self, words: &[u16; N]) -> pallas::Base {
         extract(self.hash_words_to_point(words))
+    }
+
+    /// Evaluates independent public messages using one inversion per addition column.
+    ///
+    /// This is variable-time and has exactly the complete-group semantics of
+    /// [`Self::hash_words`], not the partial-function semantics of [`HashDomain`].
+    /// Retain `scratch` between calls to reuse its allocations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if output and input lengths differ or any word is not a valid [`K`]-bit word.
+    pub fn hash_words_batch(
+        &self,
+        words: &[[u16; N]],
+        out: &mut [pallas::Base],
+        scratch: &mut BatchHashScratch,
+    ) {
+        assert_eq!(words.len(), out.len(), "one output per message");
+        if words.is_empty() {
+            return;
+        }
+        assert!(
+            words
+                .iter()
+                .flatten()
+                .all(|word| usize::from(*word) < GENERATOR_COUNT),
+            "invalid Sinsemilla word"
+        );
+        scratch.points.clear();
+        scratch.points.extend(
+            words
+                .iter()
+                .map(|words| self.first_accumulator(usize::from(words[0]))),
+        );
+        scratch
+            .generators
+            .resize(words.len(), pallas::Affine::identity());
+        scratch
+            .denominators
+            .resize(words.len(), pallas::Base::zero());
+        scratch.prefixes.resize(words.len(), pallas::Base::zero());
+        for position in 1..N {
+            for (generator, words) in scratch.generators.iter_mut().zip(words) {
+                *generator =
+                    self.weighted_generator(N - position - 1, usize::from(words[position]));
+            }
+            scratch.add_column();
+        }
+        for (out, point) in out.iter_mut().zip(&scratch.points) {
+            *out = point
+                .coordinates()
+                .map(|p| *p.x())
+                .unwrap_or_else(pallas::Base::zero);
+        }
     }
 
     /// Evaluates a bit iterator whose padded representation is exactly `N`

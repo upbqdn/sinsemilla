@@ -38,6 +38,13 @@ nontrivial discrete-logarithm relation among the independently generated
 Sinsemilla bases. See the `weighted` module's security argument. Use
 `HashDomain` when exact partial-function semantics are required.
 
+For independent public messages, `hash_words_batch` advances affine accumulators
+in lockstep and shares one inversion per addition column. Pass a retained
+`weighted::BatchHashScratch` and caller-owned output slice to reuse storage.
+This API is variable-time and must not process secret messages. Its outputs
+exactly match `hash_words`, including complete-group doubling, cancellation,
+and identity handling; it does not restore `HashDomain`'s partial-function checks.
+
 ## License
 
 Licensed under either of

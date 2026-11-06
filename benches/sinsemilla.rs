@@ -7,10 +7,11 @@
 
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use group::ff::Field;
 use pasta_curves::pallas;
-use sinsemilla::{C, CommitDomain, HashDomain, K};
+use sinsemilla::weighted::{BatchHashScratch, UncheckedFixedLengthHashDomain};
+use sinsemilla::{CommitDomain, HashDomain, C, K};
 
 /// Length in bits of a Merkle parent hash: 52 [`K`]-bit words.
 const MERKLE_HASH_BITS: usize = 52 * K;
@@ -59,6 +60,40 @@ fn hash_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn weighted_batch(c: &mut Criterion) {
+    let domain =
+        UncheckedFixedLengthHashDomain::<52>::new(&HashDomain::new("z.cash:Orchard-MerkleCRH"));
+    let mut group = c.benchmark_group("weighted_batch");
+    for count in [16usize, 64, 256, 1024] {
+        let words: Vec<[u16; 52]> = (0..count)
+            .map(|_| {
+                let mut words = core::array::from_fn(|_| rand::random::<u16>() & 0x3ff);
+                words[0] = 0;
+                words
+            })
+            .collect();
+        let mut out = vec![pallas::Base::zero(); count];
+        let mut scratch = BatchHashScratch::default();
+        domain.hash_words_batch(&words, &mut out, &mut scratch);
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
+        group.bench_function(BenchmarkId::new("scalar", count), |b| {
+            b.iter(|| {
+                for (words, out) in black_box(&words).iter().zip(&mut out) {
+                    *out = domain.hash_words(words);
+                }
+                black_box(&out);
+            });
+        });
+        group.bench_function(BenchmarkId::new("affine", count), |b| {
+            b.iter(|| {
+                domain.hash_words_batch(black_box(&words), &mut out, &mut scratch);
+                black_box(&out);
+            });
+        });
+    }
+    group.finish();
+}
+
 fn commit(c: &mut Criterion) {
     let domain = CommitDomain::new("z.cash:test-NoteCommit");
 
@@ -70,5 +105,5 @@ fn commit(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, hash, hash_batch, commit);
+criterion_group!(benches, hash, hash_batch, weighted_batch, commit);
 criterion_main!(benches);
