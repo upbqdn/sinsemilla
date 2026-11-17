@@ -111,8 +111,8 @@
 //! against one doubling and one mixed addition per word for [`HashDomain`]. The
 //! benchmarks measure both; see `benches/sinsemilla.rs`.
 //!
-//! This module needs the `std` feature, for [`std::sync::LazyLock`]. A `no_std` build
-//! has no tables and uses [`HashDomain`].
+//! The `runtime-precomputation` feature enables these tables and `std`, for
+//! [`std::sync::LazyLock`]. Without it, [`HashDomain`] uses the specification's recurrence.
 //!
 //! [`C`]: crate::C
 //! [`HashDomain`]: crate::HashDomain
@@ -178,9 +178,20 @@ const DEFAULT_TABLE_LIMIT: usize = 4 << 20;
 const DEFAULT_TABLE_LIMIT: usize = 1 << 20;
 
 /// The table budget for this build, in bytes.
-pub const TABLE_LIMIT: usize = match option_env!("SINSEMILLA_TABLE_LIMIT") {
-    Some(limit) if !limit.is_empty() => parse_usize(limit),
-    _ => DEFAULT_TABLE_LIMIT,
+///
+/// `merkle-table` enforces at least 53 rows, covering the 52-word Orchard Merkle
+/// hash even when the environment or target default requests a smaller table.
+pub const TABLE_LIMIT: usize = {
+    let configured = match option_env!("SINSEMILLA_TABLE_LIMIT") {
+        Some(limit) if !limit.is_empty() => parse_usize(limit),
+        _ => DEFAULT_TABLE_LIMIT,
+    };
+    let merkle_minimum = 53 * ROW_BYTES;
+    if cfg!(feature = "merkle-table") && configured < merkle_minimum {
+        merkle_minimum
+    } else {
+        configured
+    }
 };
 
 /// Parses a decimal `usize` at compile time, for [`TABLE_LIMIT`].
@@ -304,7 +315,47 @@ impl Tables {
     }
 }
 
-static TABLES: LazyLock<Tables> = LazyLock::new(Tables::build);
+static TABLES: LazyLock<Tables> = LazyLock::new(|| {
+    let tables = Tables::build();
+    #[cfg(any(test, feature = "test-dependencies"))]
+    TABLES_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
+    tables
+});
+
+#[cfg(any(test, feature = "test-dependencies"))]
+static TABLES_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Builds the shared position-weighted tables and covered batch first-step rows.
+///
+/// This can be called during startup to move the one-time allocation and construction
+/// cost out of the first scalar or batch hash. Calls share the same lazy initializers
+/// as hashing and return only after construction completes. Later calls do not rebuild.
+/// If the configured budget covers no messages, this does nothing.
+#[cfg(feature = "runtime-precomputation")]
+pub fn precompute() {
+    if LONGEST_MESSAGE_WORDS > 0 {
+        LazyLock::force(&TABLES);
+        for (row, &words) in FIRST_STEPS.iter().zip(&KNOWN_DOMAIN_WORDS) {
+            if words <= LONGEST_MESSAGE_WORDS {
+                LazyLock::force(row);
+            }
+        }
+    }
+}
+
+/// Returns the covered message length after table construction, or zero before it.
+#[cfg(all(
+    feature = "runtime-precomputation",
+    any(test, feature = "test-dependencies")
+))]
+pub(crate) fn precomputed_message_words() -> usize {
+    if TABLES_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+        LONGEST_MESSAGE_WORDS
+    } else {
+        0
+    }
+}
 
 /// Words each of [`KNOWN_DOMAINS`] hashes (Merkle parent, note commitment, `CommitIvk`)
 const KNOWN_DOMAIN_WORDS: [usize; 3] = [52, 109, 51];
@@ -312,19 +363,31 @@ const KNOWN_DOMAIN_WORDS: [usize; 3] = [52, 109, 51];
 /// Per known domain, at its [`KNOWN_DOMAIN_WORDS`] length `n`: $P_1$ for first word `j` =
 /// $\[2^n\] \mathcal{Q} + \[2^{n-1}\] S_j$, `None` where position 0 is $\bot$
 ///
-/// - Variable-time paths only, built on first use there (one 64 KiB row per domain, past the budget)
+/// - Built on first batch use or by `precompute()`, outside the generator-row budget.
+///   Row contents occupy `S_LEN * core::mem::size_of::<Option<Entry>>()` bytes per covered domain.
 static FIRST_STEPS: [LazyLock<Vec<Option<Entry>>>; 3] = [
     LazyLock::new(|| first_steps(0)),
     LazyLock::new(|| first_steps(1)),
     LazyLock::new(|| first_steps(2)),
 ];
 
+#[cfg(test)]
+static FIRST_STEPS_INITIALIZED: [core::sync::atomic::AtomicBool; 3] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 3];
+
 /// [`FIRST_STEPS`] row of domain `d` (only forced once `n` is covered: [`TableDomain::first_steps`])
 ///
 /// - `None` = position-0 $\bot$: `weightedHashToPoint_cons` (sinsemilla-proofs)
 fn first_steps(d: usize) -> Vec<Option<Entry>> {
     let n = KNOWN_DOMAIN_WORDS[d];
-    let start = TABLES.starts[d][n - 1];
+    let row = first_steps_from(TABLES.starts[d][n - 1], n);
+    #[cfg(test)]
+    FIRST_STEPS_INITIALIZED[d].store(true, core::sync::atomic::Ordering::Release);
+    row
+}
+
+/// Builds a first-step row from an explicit weighted start, including its exceptional entries.
+fn first_steps_from(start: pallas::Affine, n: usize) -> Vec<Option<Entry>> {
     let sums: Vec<pallas::Point> = TABLES.generators[n - 1]
         .iter()
         .map(|addend| start.to_curve() + addend.affine())
@@ -580,7 +643,9 @@ fn evaluate(start: pallas::Point, words: &[u16]) -> CtOption<pallas::Point> {
     let n = words.len();
     // The position-weighted prefix P_i, which is [2^(n-i)] Acc_i.
     let mut acc = start;
-    let mut exceptional = Choice::from(0u8);
+    // A start at the identity (Q = O) is already bottom: the first incomplete addition
+    // would take the identity as an operand.
+    let mut exceptional = acc.is_identity();
 
     for (i, &word) in words.iter().enumerate() {
         let word = usize::from(word);
@@ -747,6 +812,10 @@ impl Scratch {
 }
 
 #[cfg(test)]
+#[path = "table_exact_tests.rs"]
+mod exact_tests;
+
+#[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
 
@@ -847,6 +916,7 @@ mod tests {
     ///
     /// Without this, every test above would still pass if `new` had quietly stopped
     /// wiring the tables in.
+    #[cfg(feature = "runtime-precomputation")]
     #[test]
     fn hash_domain_dispatches_to_the_tables() {
         for personalization in KNOWN_DOMAINS {
@@ -1010,6 +1080,7 @@ mod tests {
     #[test]
     fn unknown_personalizations_have_no_table() {
         assert!(TableDomain::new("z.cash:test-Sinsemilla").is_none());
+        #[cfg(feature = "runtime-precomputation")]
         assert!(HashDomain::new("z.cash:test-Sinsemilla").tabled.is_none());
     }
 
