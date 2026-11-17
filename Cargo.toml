@@ -31,6 +31,9 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 rand = "0.10"
 
 [features]
+# Zebra builds sinsemilla with default features and can't name `merkle-table` without
+# breaking `cargo publish` against crates.io releases, which lack the feature.
+default = ["merkle-table"]
 std = []
 runtime-precomputation = ["std"]
 # Guarantee coverage of the Orchard Merkle hash, including its exceptional-case checks.
